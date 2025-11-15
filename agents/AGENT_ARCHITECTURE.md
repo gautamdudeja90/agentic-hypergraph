@@ -546,56 +546,146 @@ Response to User
 
 ---
 
-## Google ADK Implementation Guidelines
+## Google ADK Production Features & Implementation Guidelines
 
-### Agent Structure Template
+### Production-Ready Features from Google ADK
+
+Based on analysis of `/Users/gautamdudeja/repo/adk-python/src/google/adk`, our system will leverage:
+
+#### 1. **Long-Running & Stateful Operations**
+- **Session Persistence**: `SqliteSessionService` for SQLite-backed state (no Google Cloud)
+- **Agent State Management**: Pydantic-based `BaseAgentState` for structured state
+- **Event-Driven Architecture**: Event streaming with replay capability
+- **Branch Tracking**: Isolated conversation histories for multi-path exploration
+
+#### 2. **Resumability & Fault Tolerance**
+- **Resumability Config**: `ResumabilityConfig` enables pause/resume on long operations
+- **Event Replay**: Resume from last checkpoint using event history
+- **LLM Call Limits**: `max_llm_calls` prevents runaway loops (default: 500)
+- **Idempotent Operations**: Required for reliable resumption
+
+#### 3. **Artifact Management**
+- **Filesystem Backend**: `FileArtifactService` with automatic versioning
+- **Version Control**: Monotonic version IDs for all artifacts
+- **Session/User Scoping**: Isolated artifact namespaces
+- **Metadata Support**: Custom metadata per version
+
+#### 4. **Memory & Context Management**
+- **Session Memory**: Cross-conversation context via `InMemoryMemoryService`
+- **Event Compaction**: `EventsCompactionConfig` with sliding window for long sessions
+- **Context Caching**: Token optimization for repeated context (Gemini)
+
+#### 5. **Multi-Agent Orchestration**
+- **SequentialAgent**: Staged pipeline execution (ingestion → extraction → storage)
+- **ParallelAgent**: Concurrent retrieval from multiple sources
+- **LoopAgent**: Iterative refinement (gleaning, summarization)
+- **Transfer Pattern**: Dynamic agent delegation
+
+#### 6. **Open-Source Stack (No Google Cloud)**
+- **Session Storage**: SQLite (`SqliteSessionService` + `aiosqlite`)
+- **Artifact Storage**: Local filesystem (`FileArtifactService`)
+- **Memory**: In-memory service (`InMemoryMemoryService`)
+- **LLM Integration**: Any provider via `LiteLlm` (OpenAI, Anthropic, local models)
+- **Code Execution**: Local sandbox (`BuiltInCodeExecutor`)
+
+#### 7. **Observability & Monitoring**
+- **Plugin System**: Global callbacks for logging, error handling, analytics
+- **LoggingPlugin**: Comprehensive event logging
+- **OpenTelemetry**: Distributed tracing support
+- **Agent Callbacks**: Per-agent hooks for monitoring
+
+#### 8. **Production Tooling**
+- **Retry Logic**: Built into LLM and tool execution
+- **Rate Limiting**: Configurable for API calls
+- **Streaming Support**: SSE and bidirectional streaming
+- **Error Recovery**: `ReflectRetryToolPlugin` for automatic retry with reflection
+
+---
+
+### ADK Implementation Patterns for HyperGraphRAG
+
+#### Agent Structure Template
 ```python
-from google.adk import agent, AgentState, Message
-from pydantic import BaseModel
+from google.adk import LlmAgent, SequentialAgent, ParallelAgent
+from google.adk.artifacts import FileArtifactService
+from google.adk.sessions import SqliteSessionService
+from google.adk.core import BaseAgentState, ResumabilityConfig
+from pydantic import BaseModel, Field
 
-class MyAgentState(AgentState):
-    # Agent-specific state fields
-    pass
+class MyAgentState(BaseAgentState):
+    # Agent-specific state fields with persistence
+    processed_chunks: List[str] = Field(default_factory=list)
+    current_phase: str = "init"
+    retry_count: int = 0
 
 class MyAgentInput(BaseModel):
     # Input schema
-    pass
+    content: str
+    metadata: Dict[str, Any] = {}
 
 class MyAgentOutput(BaseModel):
     # Output schema
-    pass
+    result: str
+    artifacts: List[str] = []
 
-@agent(
+# LLM-based agent with tools
+my_agent = LlmAgent(
     name="my_agent",
+    model="gpt-4o-mini",  # Or any LiteLlm-supported model
+    instruction="You are an agent that...",
     state_type=MyAgentState,
-    input_type=MyAgentInput,
-    output_type=MyAgentOutput
+    tools=[tool1, tool2],  # Custom tools
+    resumable=True,  # Enable resumability
 )
-class MyAgent:
-    def __init__(self, config: dict):
-        # Initialize agent
-        pass
-
-    async def process(self, input: MyAgentInput, state: MyAgentState) -> MyAgentOutput:
-        # Main processing logic
-        pass
-
-    async def on_message(self, message: Message, state: MyAgentState):
-        # Handle incoming messages from other agents
-        pass
-
-    # Tool functions
-    async def tool_function(self, params):
-        # Call external services (storage, LLM, etc.)
-        pass
 ```
 
-### Storage Integration
+#### Hierarchical Agent Composition
 ```python
-# Keep existing storage abstractions
+from google.adk import SequentialAgent, ParallelAgent, LlmAgent, FunctionTool
+
+# Construction Pipeline (Sequential)
+construction_pipeline = SequentialAgent(
+    name="hypergraph_construction",
+    agents=[
+        document_ingestion_agent,  # Chunking
+        extraction_agent,          # Entity extraction (with gleaning loop)
+        graph_builder_agent,       # Graph construction
+        ParallelAgent(             # Parallel storage operations
+            name="storage_parallel",
+            agents=[embedding_agent, storage_coordinator_agent]
+        )
+    ],
+    state_type=ConstructionState,
+    resumable=True,
+)
+
+# Retrieval Pipeline (Parallel → Sequential)
+retrieval_pipeline = SequentialAgent(
+    name="hypergraph_retrieval",
+    agents=[
+        query_planner_agent,
+        ParallelAgent(
+            name="multi_source_retrieval",
+            agents=[
+                entity_retrieval_agent,
+                relationship_retrieval_agent,
+                text_retrieval_agent,
+            ]
+        ),
+        context_assembly_agent,
+        response_generator_agent,
+    ],
+    state_type=RetrievalState,
+    resumable=True,
+)
+```
+
+#### Storage Integration with Tools
+```python
+from google.adk import FunctionTool
 from hypergraphrag.base import BaseGraphStorage, BaseVectorStorage, BaseKVStorage
 
-# Wrap as tools for StorageCoordinatorAgent
+# Wrap storage operations as ADK tools
 class StorageTools:
     def __init__(
         self,
@@ -607,68 +697,158 @@ class StorageTools:
         self.vector = vector_storage
         self.kv = kv_storage
 
-    async def write_graph(self, nodes, edges):
-        # Graph write operations
-        pass
+    async def write_graph(self, nodes: List[dict], edges: List[dict]) -> dict:
+        """Write nodes and edges to graph storage."""
+        await self.graph.upsert_nodes(nodes)
+        await self.graph.upsert_edges(edges)
+        return {"status": "success", "nodes": len(nodes), "edges": len(edges)}
 
-    async def search_vectors(self, query_embedding, top_k):
-        # Vector search
-        pass
+    async def search_vectors(self, query_embedding: List[float], top_k: int) -> List[dict]:
+        """Semantic search in vector storage."""
+        return await self.vector.query(query_embedding, top_k=top_k)
 
-    async def get_kv(self, key):
-        # KV retrieval
-        pass
+    async def get_kv(self, key: str) -> dict:
+        """Retrieve from key-value storage."""
+        return await self.kv.get(key)
+
+# Create ADK FunctionTools from storage methods
+storage_tools = StorageTools(graph_storage, vector_storage, kv_storage)
+write_graph_tool = FunctionTool(storage_tools.write_graph)
+search_vectors_tool = FunctionTool(storage_tools.search_vectors)
+get_kv_tool = FunctionTool(storage_tools.get_kv)
 ```
 
-### Message Passing
+#### Session & Artifact Configuration
 ```python
-# Agent-to-agent communication
-from google.adk import send_message
+from google.adk import Application
+from google.adk.sessions import SqliteSessionService
+from google.adk.artifacts import FileArtifactService
+from google.adk.core import ResumabilityConfig, EventsCompactionConfig
 
-# From DocumentIngestionAgent to ExtractionAgent
-await send_message(
-    to_agent="extraction_agent",
-    message_type="chunked_document",
-    payload=chunked_doc.dict()
+# Configure production-ready app (no Google Cloud)
+app = Application(
+    name="hypergraph_rag",
+    agent=construction_pipeline,  # or retrieval_pipeline
+
+    # SQLite-backed sessions for persistence
+    session_service=SqliteSessionService(
+        db_path="./data/sessions.db",
+        compaction_config=EventsCompactionConfig(
+            enabled=True,
+            sliding_window_size=100,  # Keep last 100 events
+            overlap_size=10,           # 10 event overlap for context
+        )
+    ),
+
+    # Filesystem artifacts with versioning
+    artifact_service=FileArtifactService(
+        base_path="./data/artifacts"
+    ),
+
+    # Enable resumability for long-running operations
+    resumability_config=ResumabilityConfig(is_resumable=True),
+
+    # LLM call limits for safety
+    max_llm_calls=500,
+
+    # Streaming support
+    streaming_mode="SSE",  # or "BIDI" or "NONE"
 )
+```
 
-# From ExtractionAgent to GraphBuilderAgent
-await send_message(
-    to_agent="graph_builder_agent",
-    message_type="extraction_result",
-    payload=extraction_result.dict()
+#### Plugin System for Observability
+```python
+from google.adk.plugins import LoggingPlugin, ReflectRetryToolPlugin
+from google.adk.core import BasePlugin
+
+# Custom monitoring plugin
+class HypergraphMonitoringPlugin(BasePlugin):
+    async def on_agent_start(self, agent_name: str, state: dict):
+        # Track agent execution start
+        print(f"Agent {agent_name} started with state: {state}")
+
+    async def after_tool_callback(self, tool_name: str, result: Any):
+        # Track tool execution metrics
+        if "graph" in tool_name:
+            print(f"Graph operation: {result}")
+
+# Add plugins to application
+app.add_plugin(LoggingPlugin(log_level="INFO"))
+app.add_plugin(ReflectRetryToolPlugin(max_retries=3))
+app.add_plugin(HypergraphMonitoringPlugin())
+```
+
+#### Iterative Gleaning with LoopAgent
+```python
+from google.adk import LoopAgent, LlmAgent, FunctionTool
+
+# Multi-round entity extraction gleaning
+gleaning_agent = LoopAgent(
+    name="entity_gleaning",
+    agent=LlmAgent(
+        name="entity_extractor",
+        model="gpt-4o-mini",
+        instruction="Extract entities and relationships from text...",
+        tools=[parse_extraction_tool, merge_entities_tool],
+    ),
+    max_iterations=2,  # entity_extract_max_gleaning
+    state_type=GleaningState,
+    resumable=True,
 )
 ```
 
-### Event-Driven Coordination
+#### Artifact Versioning for Graph Snapshots
 ```python
-from google.adk import event_handler
+# Store graph snapshots as versioned artifacts
+async def save_graph_snapshot(session_id: str, graph_data: dict):
+    artifact_uri = await app.artifact_service.create_artifact(
+        session_id=session_id,
+        artifact_name="graph_snapshot",
+        content=json.dumps(graph_data).encode(),
+        metadata={"nodes": len(graph_data["nodes"]), "edges": len(graph_data["edges"])}
+    )
+    # Returns: hypergraph_rag/sessions/{session_id}/artifacts/graph_snapshot/v1
+    return artifact_uri
 
-@event_handler("extraction_complete")
-async def on_extraction_complete(event, state):
-    # Trigger graph building and embedding in parallel
-    await send_message(to_agent="graph_builder_agent", ...)
-    await send_message(to_agent="embedding_agent", ...)
+# Load specific version
+async def load_graph_snapshot(session_id: str, version: int = None):
+    artifact_data = await app.artifact_service.get_artifact(
+        session_id=session_id,
+        artifact_name="graph_snapshot",
+        version=version  # None = latest
+    )
+    return json.loads(artifact_data.content.decode())
 ```
 
-### Parallel Execution
+#### State Management for Long-Running Construction
 ```python
-import asyncio
+from google.adk.core import BaseAgentState
+from typing import List, Dict, Optional
 
-# Parallel chunk extraction
-extraction_tasks = [
-    extraction_agent.process(chunk)
-    for chunk in chunks
-]
-results = await asyncio.gather(*extraction_tasks)
+class ConstructionState(BaseAgentState):
+    """Persistent state for hypergraph construction."""
+    session_id: str
+    document_ids: List[str] = Field(default_factory=list)
+    processed_chunks: int = 0
+    total_chunks: int = 0
+    extracted_entities: int = 0
+    constructed_hyperedges: int = 0
+    current_phase: str = "init"  # init, chunking, extraction, building, embedding
+    errors: List[Dict[str, str]] = Field(default_factory=list)
 
-# Parallel retrieval
-retrieval_tasks = [
-    entity_agent.process(query),
-    relationship_agent.process(query),
-    text_agent.process(query)
-]
-entity_result, rel_result, text_result = await asyncio.gather(*retrieval_tasks)
+    # Resumability tracking
+    last_checkpoint: Optional[str] = None
+    checkpoint_timestamp: Optional[float] = None
+
+class RetrievalState(BaseAgentState):
+    """Persistent state for hypergraph retrieval."""
+    query_id: str
+    query_text: str
+    mode: str = "hybrid"
+    retrieved_entities: List[str] = Field(default_factory=list)
+    retrieved_relationships: List[str] = Field(default_factory=list)
+    context_tokens: int = 0
+    cache_hit: bool = False
 ```
 
 ---
@@ -823,38 +1003,125 @@ entity_result, rel_result, text_result = await asyncio.gather(*retrieval_tasks)
 
 ## Configuration Management
 
-### Agent Configuration Schema
+### Production Configuration Schema
 ```python
+from pydantic import BaseModel, Field
+from typing import Optional
+
 class HyperGraphRAGConfig(BaseModel):
-    # Construction settings
+    # === Construction Settings ===
     chunk_token_size: int = 1200
     chunk_overlap: int = 100
     entity_extract_max_gleaning: int = 2
 
-    # Retrieval settings
+    # === Retrieval Settings ===
     top_k_entities: int = 20
     top_k_relationships: int = 20
     top_k_texts: int = 10
     context_max_tokens: int = 4000
 
-    # LLM settings
+    # === LLM Settings ===
     llm_model: str = "gpt-4o-mini"
     embedding_model: str = "text-embedding-3-small"
     embedding_batch_size: int = 100
 
-    # Storage backends
+    # === Storage Backends (Open Source) ===
     kv_storage_type: str = "JsonKVStorage"
     vector_storage_type: str = "NanoVectorDBStorage"
     graph_storage_type: str = "NetworkXStorage"
 
-    # Caching
+    # === Caching ===
     enable_embedding_cache: bool = True
     enable_query_cache: bool = True
     enable_llm_cache: bool = True
 
-    # Concurrency
+    # === Concurrency ===
     max_concurrent_llm_calls: int = 16
     max_concurrent_embeddings: int = 64
+
+    # === ADK Production Features ===
+    # Session persistence
+    session_db_path: str = "./data/sessions.db"
+    enable_session_persistence: bool = True
+
+    # Artifact management
+    artifact_base_path: str = "./data/artifacts"
+    enable_artifact_versioning: bool = True
+
+    # Resumability & fault tolerance
+    enable_resumability: bool = True
+    max_llm_calls_per_session: int = 500
+
+    # Event compaction for long sessions
+    event_compaction_enabled: bool = True
+    event_sliding_window_size: int = 100
+    event_overlap_size: int = 10
+
+    # Monitoring & observability
+    enable_logging_plugin: bool = True
+    enable_error_recovery: bool = True
+    max_tool_retries: int = 3
+    log_level: str = "INFO"
+
+    # Streaming
+    streaming_mode: str = "SSE"  # "SSE", "BIDI", or "NONE"
+```
+
+### Application Initialization with Production Features
+```python
+from google.adk import Application, LlmAgent, SequentialAgent, ParallelAgent
+from google.adk.sessions import SqliteSessionService
+from google.adk.artifacts import FileArtifactService
+from google.adk.core import ResumabilityConfig, EventsCompactionConfig
+from google.adk.plugins import LoggingPlugin, ReflectRetryToolPlugin
+
+def create_hypergraph_app(config: HyperGraphRAGConfig) -> Application:
+    """Create production-ready HyperGraphRAG application with ADK features."""
+
+    # Build agent hierarchy
+    construction_pipeline = build_construction_pipeline(config)
+    retrieval_pipeline = build_retrieval_pipeline(config)
+
+    # Create main application
+    app = Application(
+        name="hypergraph_rag",
+        agent=construction_pipeline,  # Can switch to retrieval_pipeline
+
+        # SQLite sessions (no Google Cloud)
+        session_service=SqliteSessionService(
+            db_path=config.session_db_path,
+            compaction_config=EventsCompactionConfig(
+                enabled=config.event_compaction_enabled,
+                sliding_window_size=config.event_sliding_window_size,
+                overlap_size=config.event_overlap_size,
+            )
+        ) if config.enable_session_persistence else None,
+
+        # Filesystem artifacts with versioning
+        artifact_service=FileArtifactService(
+            base_path=config.artifact_base_path
+        ) if config.enable_artifact_versioning else None,
+
+        # Resumability for long-running operations
+        resumability_config=ResumabilityConfig(
+            is_resumable=config.enable_resumability
+        ),
+
+        # Safety limits
+        max_llm_calls=config.max_llm_calls_per_session,
+
+        # Streaming
+        streaming_mode=config.streaming_mode,
+    )
+
+    # Add production plugins
+    if config.enable_logging_plugin:
+        app.add_plugin(LoggingPlugin(log_level=config.log_level))
+
+    if config.enable_error_recovery:
+        app.add_plugin(ReflectRetryToolPlugin(max_retries=config.max_tool_retries))
+
+    return app
 ```
 
 ---

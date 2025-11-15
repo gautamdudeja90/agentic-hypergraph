@@ -1,0 +1,34 @@
+# Core dependencies
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+
+# Google ADK
+# Install from: /Users/gautamdudeja/repo/adk-python
+# pip install -e /Users/gautamdudeja/repo/adk-python
+
+# HyperGraphRAG dependencies (from source)
+networkx>=3.0
+numpy>=1.24.0
+nano-vectordb>=0.0.8
+tiktoken>=0.5.0
+tenacity>=8.2.0
+
+# LLM providers
+openai>=1.0.0
+# litellm  # Optional: for multi-provider support
+
+# Storage backends (optional)
+aiosqlite>=0.19.0  # For ADK session persistence
+# neo4j>=5.0.0  # Optional: Neo4j graph storage
+# pymongo>=4.0.0  # Optional: MongoDB storage
+# pymilvus>=2.3.0  # Optional: Milvus vector DB
+# chromadb>=0.4.0  # Optional: Chroma vector DB
+
+# Development
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+black>=23.0.0
+mypy>=1.0.0
+
+# Progress bars
+tqdm>=4.65.0
